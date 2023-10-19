@@ -4,8 +4,9 @@ import mathutils
 import atexit
 import os
 from gpu_extras.presets import draw_texture_2d
-import socket, sys, struct, pickle
-from multiprocessing import shared_memory, SimpleQueue
+import collections, queue, selectors, socket, sys, struct, typing, pickle
+from multiprocessing import shared_memory
+from queue import SimpleQueue
 from bpy.app.handlers import persistent
 
 bl_info = {
@@ -56,6 +57,30 @@ def showMessageBox(message = "", title = "Blender Layer", icon = 'INFO'):
         self.layout.label(text=message)
     bpy.context.window_manager.popup_menu(draw, title = title, icon = icon)
 
+def isShmMarkedRead(shm: shared_memory.SharedMemory) -> bool:
+    isReadPrefix = b"SharedMemory has been read"
+    return shm.buf[:len(isReadPrefix)] == isReadPrefix[:shm.size]
+
+
+class WaitableSimpleQueue(queue.SimpleQueue):
+    """SimpleQueue that can be waited on using selectors."""
+    def __init__(self):
+        super().__init__()
+        self.putSock, self.getSock = socket.socketpair()
+
+    def fileno(self):
+        return self.getSock.fileno()
+
+    def get(self, *args, **kwargs):
+        item = super().get(*args, **kwargs)
+        self.getSock.recv(1)
+        return item
+
+    def put(self, item, *args, **kwargs):
+        super().put(item, *args, **kwargs)
+        self.putSock.send(b'\x01')
+
+
 class BlenderLayerClient():
     def __init__(self):
         self.connected = False
@@ -73,8 +98,9 @@ class BlenderLayerClient():
         self.disconnect()
            
         self.recvQueue = SimpleQueue()    
-        self.sendQueue = SimpleQueue()
+        self.sendQueue = WaitableSimpleQueue()
         self.buf = []
+        self.noUpdatePending = threading.Event()  # Set when updateFlag becomes False
         self.updateFlag = False
         self.requestFrame = True
         self.requestDelayedFrame = False
@@ -741,12 +767,27 @@ class BlenderLayerClient():
             
     def sendData(self):
         try:
+            sel = selectors.DefaultSelector()
+            sel.register(self.s, selectors.EVENT_READ)
+            sel.register(self.sendQueue, selectors.EVENT_READ)
+
+            class ShmUpdate(typing.NamedTuple):
+                """A pending update to the shared memory buffer."""
+                msg: tuple
+                buf: bytes
+
+            # A frame that's waiting to be written to shared memory.
+            # This frame may be dropped if the server doesn't mark the shared memory buffer as read
+            # before another frame is ready.
+            pendingShm: typing.Optional[ShmUpdate] = None
+
+            # Queue for updates to the shared memory buffer when drawing an animation
+            animShmQueue: typing.Deque[ShmUpdate] = collections.deque(maxlen=16)
+
             while self.connected:
                 msgs = []
 
                 if self.updateFlag:
-                    self.updateFlag = False
-                    
                     scale = self.scale
                     x = self.regionX
                     y = self.regionY
@@ -773,17 +814,42 @@ class BlenderLayerClient():
                                 self.updateFlag = False
                                 self.sendMessage(('updateProgress', self.animEnd, self.animStart, self.animEnd))
                         if self.sharedMem:
-                            self.shm.buf[:len(b)] = b
-                            msgs.append((type, x, y, w * scale, h * scale, None, frame))
+                            msg = (type, x, y, w * scale, h * scale, None, frame)
+                            if self.isAnimation:
+                                animShmQueue.append(ShmUpdate(msg, b))
+                                pendingShm = None
+                            else:
+                                pendingShm = ShmUpdate(msg, b)
                         else:
                             msgs.append((type, x, y, w * scale, h * scale, b, frame))
                     else:
                         print("[Blender Layer] Warning: Ignorig frame with outdated dimensions")
+                    self.updateFlag = False
+
+                if animShmQueue or pendingShm:
+                    if not self.sharedMem:
+                        animShmQueue.clear()
+                        pendingShm = None
+                    elif isShmMarkedRead(self.shm):
+                        # Update shared memory only when the server has marked it as read
+                        if animShmQueue:
+                            msg, b = animShmQueue.popleft()
+                        elif pendingShm is not None:
+                            msg, b = pendingShm
+                            pendingShm = None
+                        self.shm.buf[:len(b)] = b
+                        msgs.append(msg)
+
+                # Block until self.sendQueue or self.s have unread data or timeout has elapsed
+                readAvailable = [key.fileobj for key, _ in sel.select(timeout=0.01 if animShmQueue or pendingShm
+                                                                              else 1.0)]
 
                 lastType = None
                 while not self.sendQueue.empty():
                     msg = self.sendQueue.get()
                     type = msg[0]
+                    if type == 'dummy':
+                        continue
                     if type == lastType:
                         if type == 'posePreviews':
                             msg[1].extend(msgs[-1][1])
@@ -794,18 +860,27 @@ class BlenderLayerClient():
 
                 if not self.connected:
                     break
-                  
-                sendObj(self.s, msgs)
+
+                if msgs:
+                    sendObj(self.s, msgs)
                 
                 if not self.connected:
                     break
-                    
-                msgs = recvObj(self.s)
-                while msgs == 'wait':
+
+                while self.s in readAvailable:
                     msgs = recvObj(self.s)
-                if msgs:                        
-                    for msg in msgs:
-                        self.recvQueue.put(msg)
+                    while msgs == 'wait':
+                        msgs = recvObj(self.s)
+                    if msgs:
+                        for msg in msgs:
+                            self.recvQueue.put(msg)
+                    elif msgs is None:
+                        print("[Blender Layer] Connection lost")
+                        self.requestDisconnect = True
+                        break
+                    readAvailable = [key.fileobj for key, _ in sel.select(timeout=0)]
+                if self.requestDisconnect:
+                    break
 
                 #time.sleep(0.333)
         except Exception as e:
@@ -831,7 +906,13 @@ class BlenderLayerClient():
                 else:
                     self.offscreen.draw_view3d( context.scene, context.view_layer, space, region, vm, pm, do_color_management=self.colorManagement)
                 space.overlay.show_overlays = original_overlays           
-                self.buf = self.offscreen.texture_color.read()
+                buf = self.offscreen.texture_color.read()
+
+                # If there is already a frame in self.buf that needs to be sent then wait
+                while self.connected and not self.noUpdatePending.wait(0.01):
+                    pass
+
+                self.buf = buf
                 self.updateFlag = not self.isRendering and (self.updateMode == 0 and self.frame % self.framerateScale == 0 or self.updateMode != 0 and self.requestFrame or self.isAnimation and context.scene.frame_current == self.animFrame)
                 self.requestFrame = False
             elif self.updateMode == 0:            
@@ -899,6 +980,21 @@ class BlenderLayerClient():
                 pm[1][2] = pm[1][2] * m + shiftY
             
         return (vm, pm)
+
+    @property
+    def updateFlag(self) -> bool:
+        return not self.noUpdatePending.is_set()
+
+    @updateFlag.setter
+    def updateFlag(self, flag_value: bool):
+        flag_value = bool(flag_value)
+        if flag_value:
+            self.noUpdatePending.clear()
+            # sendData blocks while it waits for messages, so send a dummy message to unblock.
+            self.sendMessage(('dummy',))
+        else:
+            self.noUpdatePending.set()
+
 
 class ConnectOperator(bpy.types.Operator):
     bl_idname = 'view.connect_krita'

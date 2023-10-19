@@ -1,5 +1,6 @@
-import subprocess, time, socket, sys, math, struct, pickle, errno  
-from multiprocessing import shared_memory, SimpleQueue
+import selectors, subprocess, time, socket, sys, math, struct, pickle, errno
+from multiprocessing import shared_memory
+from queue import SimpleQueue
 from PyQt5.QtCore import QRunnable, QObject, pyqtSignal, QByteArray
 from PyQt5.QtGui import QImage
 
@@ -25,6 +26,18 @@ def recvAll(conn, n):
         data.extend(packet)
     return data
 
+def markShmRead(shm: shared_memory.SharedMemory) -> None:
+    """Marks a shared memory's buffer as having been read and ready for reuse.
+    This overwrites some of the contents of the shared memory.
+    """
+    isReadPrefix = b"SharedMemory has been read"
+    shm.buf[:len(isReadPrefix)] = isReadPrefix[:shm.size]
+
+def isShmMarkedRead(shm: shared_memory.SharedMemory) -> bool:
+    """Returns True if shm has already been marked as read by markShmRead."""
+    isReadPrefix = b"SharedMemory has been read"
+    return shm.buf[:len(isReadPrefix)] == isReadPrefix[:shm.size]
+
 instance = Krita.instance()
 
 class RunnableSignals(QObject):
@@ -33,13 +46,33 @@ class RunnableSignals(QObject):
     error = pyqtSignal(str)
     msgReceived = pyqtSignal(object)
 
+
+class WaitableSimpleQueue(SimpleQueue):
+    """SimpleQueue that can be waited on using selectors."""
+    def __init__(self):
+        super().__init__()
+        self.putSock, self.getSock = socket.socketpair()
+
+    def fileno(self):
+        return self.getSock.fileno()
+
+    def get(self, *args, **kwargs):
+        item = super().get(*args, **kwargs)
+        self.getSock.recv(1)
+        return item
+
+    def put(self, item, *args, **kwargs):
+        super().put(item, *args, **kwargs)
+        self.putSock.send(b'\x01')
+
+
 class BlenderLayerServer(QRunnable):
     def __init__(self, settings):
         super().__init__()
         self.settings = settings
         self.running = False
         self.signals = RunnableSignals()
-        self.sendQueue = SimpleQueue()
+        self.sendQueue = WaitableSimpleQueue()
         
     def sendMessage(self, msg):
         self.sendQueue.put(msg)
@@ -105,6 +138,7 @@ class BlenderLayerServer(QRunnable):
             
             if self.settings.sharedMem:
                 shm = shared_memory.SharedMemory(name=(f'krita_blender_layer:{PORT}'), create=True, size=bytesPerPixel * orgWidth * orgHeight)
+                markShmRead(shm)  # Mark as read so the client knows it's safe to write
             i = 0
             resultStr = ''
             while self.running:
@@ -131,6 +165,10 @@ class BlenderLayerServer(QRunnable):
 
                     sendObj(conn, ('Init', width, height, self.settings.regionX, self.settings.regionY, self.settings.regionWidth, self.settings.regionHeight, self.settings.regionViewport, self.settings.scale, self.settings.framerateScale, format, bytesPerPixel, self.settings.colorManageBlender, convertBGR, self.settings.transparency, self.settings.gizmos, self.settings.lensZoom, self.settings.viewMode, self.settings.updateMode, self.settings.renderCurrentView, self.settings.sharedMem, self.settings.backgroundDraw))
                     self.signals.connected.emit(True, recvObj(conn))
+
+                    sel = selectors.DefaultSelector()
+                    sel.register(conn, selectors.EVENT_READ)
+                    sel.register(self.sendQueue, selectors.EVENT_READ)
                     
                     while self.running:
                         if l == None or l == 0:
@@ -153,7 +191,16 @@ class BlenderLayerServer(QRunnable):
                                     self.settings.regionHeight = height
                                     self.sendMessage(('region', self.settings.regionX, self.settings.regionY, self.settings.regionWidth, self.settings.regionHeight, self.settings.regionViewport))
 
-                        msgs = recvObj(conn)
+                        # Block until self.sendQueue or conn have unread data or timeout has elapsed
+                        readAvailable = [key.fileobj for key, _ in sel.select(timeout=0.01 if locked else 1.0)]
+
+                        if conn in readAvailable:
+                            msgs = recvObj(conn)
+                            if msgs is None:
+                                self.running = False
+                        else:
+                            msgs = ()
+
                         if msgs:
                             for msg in msgs:
                                 if msg[0] == 'update' or msg[0] == 'updateFrame' or msg[0] == 'updateFrameFromFile' or msg[0] == 'updateFromFile' or msg[0] == 'clear':
@@ -191,7 +238,14 @@ class BlenderLayerServer(QRunnable):
                                             if msg[5]:
                                                 l.setPixelData(QByteArray(msg[5]), x, y, w, h)
                                             elif shm:
-                                                l.setPixelData(QByteArray(shm.buf.tobytes()), x, y, w, h)
+                                                if isShmMarkedRead(shm):
+                                                    self.signals.error.emit(i18n("SharedMemory is already marked as read"))
+                                                    continue
+                                                pixelData = shm.buf.tobytes()
+                                                markShmRead(shm)
+                                                sendObj(conn, [])  # Send a blank message to wake the client thread
+                                                l.setPixelData(QByteArray(pixelData), x, y, w, h)
+
                                             d.refreshProjection()
                                             if modifiedSupported:
                                                 d.setModified(True)
@@ -232,8 +286,12 @@ class BlenderLayerServer(QRunnable):
                                         else:
                                             l.setPixelData(QByteArray(bytes(d.width() * d.height() * 4)), 0, 0, d.width(), d.height())
 
-                                    elif self.settings.updateMode > 0:
-                                        self.signals.error.emit(i18n("Warning: Failed to acquire lock. Dropping a frame"))
+                                    else:
+                                        if shm:
+                                            # Mark shared memory as read when dropping frames
+                                            markShmRead(shm)
+                                        if self.settings.updateMode > 0:
+                                            self.signals.error.emit(i18n("Warning: Failed to acquire lock. Dropping a frame"))
                                 elif msg[0] == 'updateAnimation':
                                     start = msg[3]
                                     end = msg[4]
@@ -289,6 +347,7 @@ class BlenderLayerServer(QRunnable):
                                                 time.sleep(0.01)
                                             if self.running:
                                                 sendObj(conn, 'wait')
+                                    sendObj(conn, [])  # Tell the client to stop waiting
 
                                     d.waitForDone()
                                     l.setLocked(True)
@@ -320,7 +379,7 @@ class BlenderLayerServer(QRunnable):
                                 msgs.append(msg)
                             lastType = type
                                                             
-                        if self.running:
+                        if self.running and msgs:
                             sendObj(conn, msgs)
 
                     conn.close()
