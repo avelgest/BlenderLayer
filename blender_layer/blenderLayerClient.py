@@ -7,6 +7,7 @@ from gpu_extras.presets import draw_texture_2d
 import collections, queue, selectors, socket, sys, struct, typing, pickle
 from multiprocessing import shared_memory
 from queue import SimpleQueue
+from typing import Optional
 from bpy.app.handlers import persistent
 
 bl_info = {
@@ -120,6 +121,7 @@ class BlenderLayerClient():
         self.isRendering = False
         self.isAnimation = False
         self.animFrame = 0
+        self.prevAnimFrame: Optional[int] = None  # The last frame to have been drawn
         self.ticksWaitingForFrame = 0
         self.requestDisconnect = False
 
@@ -650,6 +652,7 @@ class BlenderLayerClient():
                         self.animSteps = scene.frame_step
                         
                     self.animFrame = self.animStart
+                    self.prevAnimFrame = None
 
                     self.isAnimation = True                
                     self.requestFrame = False
@@ -779,13 +782,17 @@ class BlenderLayerClient():
             # A frame that's waiting to be written to shared memory.
             # This frame may be dropped if the server doesn't mark the shared memory buffer as read
             # before another frame is ready.
-            pendingShm: typing.Optional[ShmUpdate] = None
+            pendingShm: Optional[ShmUpdate] = None
 
             # Queue for updates to the shared memory buffer when drawing an animation
-            animShmQueue: typing.Deque[ShmUpdate] = collections.deque(maxlen=16)
+            animShmQueue: typing.Deque[ShmUpdate] = collections.deque(maxlen=32)
 
             while self.connected:
                 msgs = []
+
+                # Block until self.sendQueue or self.s have unread data or timeout has elapsed
+                readAvailable = [key.fileobj for key, _ in sel.select(timeout=0.01 if animShmQueue or pendingShm
+                                                                              else 1.0)]
 
                 if self.updateFlag:
                     scale = self.scale
@@ -795,6 +802,7 @@ class BlenderLayerClient():
                     w = self.regionWidth // scale
                     if len(self.buf) == h and len(self.buf[0]) == w:
                         b = np.array(self.buf, copy=False, dtype=self.dtype).ravel(order = 'F')
+                        self.updateFlag = False
                         if self.bgrConversion:
                             b = b.reshape(h, w, 4)[::-1,:,[2, 1, 0, 3]]
                         else:
@@ -815,7 +823,7 @@ class BlenderLayerClient():
                                 self.sendMessage(('updateProgress', self.animEnd, self.animStart, self.animEnd))
                         if self.sharedMem:
                             msg = (type, x, y, w * scale, h * scale, None, frame)
-                            if self.isAnimation:
+                            if type == 'updateFrame':
                                 animShmQueue.append(ShmUpdate(msg, b))
                                 pendingShm = None
                             else:
@@ -824,7 +832,7 @@ class BlenderLayerClient():
                             msgs.append((type, x, y, w * scale, h * scale, b, frame))
                     else:
                         print("[Blender Layer] Warning: Ignorig frame with outdated dimensions")
-                    self.updateFlag = False
+                        self.updateFlag = False
 
                 if animShmQueue or pendingShm:
                     if not self.sharedMem:
@@ -836,13 +844,10 @@ class BlenderLayerClient():
                             msg, b = animShmQueue.popleft()
                         elif pendingShm is not None:
                             msg, b = pendingShm
-                            pendingShm = None
+
+                        pendingShm = None
                         self.shm.buf[:len(b)] = b
                         msgs.append(msg)
-
-                # Block until self.sendQueue or self.s have unread data or timeout has elapsed
-                readAvailable = [key.fileobj for key, _ in sel.select(timeout=0.01 if animShmQueue or pendingShm
-                                                                              else 1.0)]
 
                 lastType = None
                 while not self.sendQueue.empty():
@@ -863,11 +868,8 @@ class BlenderLayerClient():
 
                 if msgs:
                     sendObj(self.s, msgs)
-                
-                if not self.connected:
-                    break
 
-                while self.s in readAvailable:
+                while self.connected and self.s in readAvailable:
                     msgs = recvObj(self.s)
                     while msgs == 'wait':
                         msgs = recvObj(self.s)
@@ -896,6 +898,12 @@ class BlenderLayerClient():
             gizmos = self.gizmos or (space.shading.type == 'RENDERED' and bpy.context.scene.render.engine == 'CYCLES')
              
             if self.connected and not self.isRendering and (self.updateMode == 0 and self.frame % self.framerateScale == 0 or self.updateMode != 0 and self.requestFrame or self.isAnimation and context.scene.frame_current == self.animFrame):
+                if self.isAnimation:
+                    if self.animFrame == self.prevAnimFrame:
+                        # Prevent frames from being drawn more than once when animating
+                        return
+                    self.prevAnimFrame = self.animFrame
+
                 if not self.offscreen:
                     self.offscreen = gpu.types.GPUOffScreen(self.regionWidth // self.scale, self.regionHeight // self.scale, format=self.formatDepth)
                                   
