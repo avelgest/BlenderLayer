@@ -169,6 +169,8 @@ class BlenderLayerServer(QRunnable):
                     sel = selectors.DefaultSelector()
                     sel.register(conn, selectors.EVENT_READ)
                     sel.register(self.sendQueue, selectors.EVENT_READ)
+
+                    requestFrame = False
                     
                     while self.running:
                         if l == None or l == 0:
@@ -351,6 +353,9 @@ class BlenderLayerServer(QRunnable):
 
                                     d.waitForDone()
                                     l.setLocked(True)
+                                elif msg[0] == 'sceneChanged':
+                                    if self.settings.updateMode == 2:
+                                        requestFrame = True
                                 else:
                                     self.signals.msgReceived.emit(msg)
                              
@@ -362,6 +367,10 @@ class BlenderLayerServer(QRunnable):
                                 locked = False
                                 framesLocked = 0
                                 
+                        if requestFrame:
+                            requestFrame = False
+                            self.sendMessage(('requestFrame', True))
+
                         msgs = []
                         lastType = None
                         while not self.sendQueue.empty():

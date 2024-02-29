@@ -115,6 +115,7 @@ class BlenderLayerClient():
         self.prevEngine = None
         self.prevPoseLib = None
         self.prevArmatures = None
+        self.prevViewMat = None
         self.active_space = None
         self.active_region = None
         self.offscreen = None
@@ -169,6 +170,7 @@ class BlenderLayerClient():
             bpy.app.handlers.save_post.append(self.onFileSaved)
             bpy.app.handlers.load_post.append(self.onFileLoaded)
             bpy.app.handlers.depsgraph_update_post.append(self.onDepsGraphChanged)
+            bpy.app.handlers.frame_change_post.append(self.onFrameChangePost)
             
             self.thread = threading.Thread(target=self.sendData, args=(), daemon=True)
             self.thread.start()
@@ -216,6 +218,7 @@ class BlenderLayerClient():
                 bpy.app.handlers.save_post.remove(self.onFileSaved)
                 bpy.app.handlers.load_post.remove(self.onFileLoaded)
                 bpy.app.handlers.depsgraph_update_post.remove(self.onDepsGraphChanged)
+                bpy.app.handlers.frame_change_post.remove(self.onFrameChangePost)
             except Exception as e:
                 print(e)
                       
@@ -322,6 +325,14 @@ class BlenderLayerClient():
             self.updatePoseLib(False)
         self.prevNumIds = numIds
         
+        if self.updateMode == 2 and not self.isAnimation and not self.isRendering:
+            self.sendMessage(('sceneChanged',))
+
+    @persistent
+    def onFrameChangePost(self, scene, *args, **kwargs):
+        if self.updateMode == 2 and not self.isAnimation and not self.isRendering:
+            self.sendMessage(('sceneChanged',))
+
     def updatePoseLib(self, clear = True):
         armatures = {}
         for obj in bpy.data.objects:
@@ -602,7 +613,7 @@ class BlenderLayerClient():
                         self.isAnimation = type == 'renderAnimation'
                         self.requestFrame = False
                         self.updateFlag = False
-                        self.updateMode = 2
+                        self.updateMode = 3
                         try:
                             if self.renderCurrentView and space.region_3d.view_perspective != 'CAMERA':
                                 cam = bpy.data.cameras.new('BlenderLayer_TMP')
@@ -657,7 +668,7 @@ class BlenderLayerClient():
                     self.isAnimation = True                
                     self.requestFrame = False
                     self.updateFlag = False
-                    self.updateMode = 2
+                    self.updateMode = 3
                         
                     self.sendMessage(('updateAnimation', msg[3], fps, self.animStart, self.animEnd, self.animSteps))
                 elif type == 'requestFrame':
@@ -709,6 +720,7 @@ class BlenderLayerClient():
             ortho = space.region_3d.view_perspective == 'ORTHO'
             shading = ['WIREFRAME', 'SOLID', 'MATERIAL', 'RENDERED'].index(space.shading.type)
             engine = bpy.context.scene.render.engine
+            viewMat = space.region_3d.view_matrix
             
             if flag:
                 if space.region_3d.view_perspective == 'CAMERA':
@@ -738,11 +750,16 @@ class BlenderLayerClient():
             if self.isAnimation and not self.isRendering and bpy.context.scene.frame_current != self.animFrame:
                 bpy.context.scene.frame_set(self.animFrame)
                 
+            if (self.updateMode == 2 and self.viewMode == 0 and not self.isAnimation and not self.isRendering
+                    and (viewMat != self.prevViewMat or lens != self.prevLens or shading != self.prevShading)):
+                self.sendMessage(('sceneChanged',))
+
             self.prevRot = rot
             self.prevLens = lens
             self.prevOrtho = ortho
             self.prevShading = shading
             self.prevEngine = engine
+            self.prevViewMat = viewMat.copy()
             
             if self.requestFrame or self.updateMode == 0:
                 self.ticksWaitingForFrame = self.ticksWaitingForFrame + 1
@@ -761,13 +778,13 @@ class BlenderLayerClient():
         self.active_region = bpy.context.region
 
         if self.requestDelayedFrame:
-            if self.updateMode != 2:
+            if self.updateMode != 3:
                 self.requestFrame = True
             self.requestDelayedFrame = False
 
         if self.connected and not self.backgroundDraw:
             self.draw(self.active_space, self.active_region)
-            
+
     def sendData(self):
         try:
             sel = selectors.DefaultSelector()
@@ -896,9 +913,10 @@ class BlenderLayerClient():
             self.frame = self.frame + 1
             original_overlays = space.overlay.show_overlays
             gizmos = self.gizmos or (space.shading.type == 'RENDERED' and bpy.context.scene.render.engine == 'CYCLES')
+            isAnimation = self.isAnimation
              
-            if self.connected and not self.isRendering and (self.updateMode == 0 and self.frame % self.framerateScale == 0 or self.updateMode != 0 and self.requestFrame or self.isAnimation and context.scene.frame_current == self.animFrame):
-                if self.isAnimation:
+            if self.connected and not self.isRendering and (self.updateMode == 0 and self.frame % self.framerateScale == 0 or self.updateMode != 0 and self.requestFrame or isAnimation and context.scene.frame_current == self.animFrame):
+                if isAnimation:
                     if self.animFrame == self.prevAnimFrame:
                         # Prevent frames from being drawn more than once when animating
                         return
@@ -919,6 +937,10 @@ class BlenderLayerClient():
                 # If there is already a frame in self.buf that needs to be sent then wait
                 while self.connected and not self.noUpdatePending.wait(0.01):
                     pass
+
+                if isAnimation != self.isAnimation:
+                    # If an animation update has started during the draw then drop this frame
+                    return
 
                 self.buf = buf
                 self.updateFlag = not self.isRendering and (self.updateMode == 0 and self.frame % self.framerateScale == 0 or self.updateMode != 0 and self.requestFrame or self.isAnimation and context.scene.frame_current == self.animFrame)

@@ -237,11 +237,12 @@ class BlenderLayer(DockWidget):
         updateHBoxLayout = QHBoxLayout()
         updateLabel = QLabel(i18n("Update mode")) 
         updateComboBox = QComboBox()
-        updateComboBox.addItems([i18n("Live"), i18n("Auto"), i18n("Manual")])
+        updateComboBox.addItems([i18n("Live"), i18n("Auto"), i18n("Auto (Update from Blender)"), i18n("Manual")])
         updateComboBox.setCurrentIndex(1)
         updateComboBox.setItemData(0, i18n("Periodically update even when Krita is not in focus"), QtCore.Qt.ToolTipRole)
         updateComboBox.setItemData(1, i18n("Only update when settings change or Krita regains focus\n(Recommended)"), QtCore.Qt.ToolTipRole)
-        updateComboBox.setItemData(2, i18n("Only update when the update button is pressed\n(Recommended for large resolutions)"), QtCore.Qt.ToolTipRole)
+        updateComboBox.setItemData(2, i18n("Only update when settings change in Blender or in Krita\n"), QtCore.Qt.ToolTipRole)
+        updateComboBox.setItemData(3, i18n("Only update when the update button is pressed\n(Recommended for large resolutions)"), QtCore.Qt.ToolTipRole)
         updateComboBox.setToolTip(i18n("Select when to update the view"))
        
         updateHBoxLayout.addWidget(updateLabel)
@@ -514,7 +515,7 @@ class BlenderLayer(DockWidget):
             self.dropEvent(event)
             self.setVisible(True)
             return True
-        elif type(source) == QMainWindow and event.type() == QEvent.WindowActivate and self.settings.updateMode == 1 and self.server and self.server.running:
+        elif type(source) == QMainWindow and event.type() == QEvent.WindowActivate and self.settings.updateMode in (1, 2) and self.server and self.server.running:
             self.server.sendMessage(('requestFrame', True))
         elif (event.type() == QEvent.ContextMenu and source is self.poseList):
             menu = QtWidgets.QMenu()
@@ -982,7 +983,7 @@ class BlenderLayer(DockWidget):
         elif type == 'engine':
             self.updateCyclesWarning(msg[1], self.settings.shading)
         elif type == 'updateProgress':
-            self.update.setCurrentIndex(2)
+            self.update.setCurrentIndex(3)
             self.setStatus(i18n("Updated animation frame"))
             inProgress = msg[1] < msg[3]
             self.progress.setVisible(inProgress)
@@ -992,7 +993,7 @@ class BlenderLayer(DockWidget):
             self.progress.setValue(msg[1])
         elif type == 'renderProgress':
             self.view.setCurrentIndex(2)
-            self.update.setCurrentIndex(2)
+            self.update.setCurrentIndex(3)
             self.setStatus(i18n("Updated from render result"))
             inProgress = msg[1] < msg[3]
             self.progress.setVisible(inProgress)
@@ -1276,7 +1277,7 @@ class BlenderLayer(DockWidget):
         dialog.show()
         dialog.activateWindow()
         if dialog.exec_() == QDialog.Accepted:
-            self.update.setCurrentIndex(2)
+            self.update.setCurrentIndex(3)
             if render:
                 self.server.sendMessage(('renderAnimation', self.renderOverride.isChecked(), self.renderTemporary.isChecked(), self.renderOverridePath.isChecked(), self.settings.renderPath, self.renderOverrideRes.isChecked(), self.renderTransparency.isChecked(),
                 overrideGroupBox.isChecked(), temporaryCheck.isChecked(), overrideKritaCheck.isChecked(), frameRateSpinBox.value(), clipStartSpinBox.value(), clipEndSpinBox.value(), stepSpinBox.value()))
@@ -1433,7 +1434,7 @@ class BlenderLayer(DockWidget):
         self.updateRate.setVisible(index == 0)
         self.updateRateLabel.setVisible(index == 0)
         self.updateSeperator.setVisible(index != 0)
-        self.manualWarning.setVisible(index == 2)
+        self.manualWarning.setVisible(index == 3)
         self.setLayoutVisible(self.updateButtonLayout, index != 0)
             
     def setLayoutVisible(self, layout, visible):
