@@ -1,3 +1,9 @@
+This is a fork of Yuntokon's [Blender Layer](https://github.com/Yuntokon/BlenderLayer).
+
+Changes:
+- Implemented "Auto (Update from Blender)" update mode (updates the layer whenever changes are made in Blender).
+- Reduced CPU usage when idle.
+
 # Blender Layer
 See Krita Artists [post](https://krita-artists.org/t/plugin-blender-layer-live-3d-view-in-krita/63394) for more info.
 
